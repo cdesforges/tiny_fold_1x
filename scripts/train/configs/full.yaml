@@ -1,31 +1,31 @@
 trainer:
-  accelerator: mps # [gpu]
+  accelerator: gpu # [gpu]
   devices: 1
-  precision: 32
-  gradient_clip_val: 10.0
+  precision: 16
+  gradient_clip_val: 1.0
   max_epochs: -1
-  accumulate_grad_batches: 8    # to adjust depending on the number of devices
+  accumulate_grad_batches: 4    # to adjust depending on the number of devices
   limit_val_batches: 10
 
-## Optional set wandb here
-#wandb:
-#  name: full-test-esm-smi-ted-v3
+# # Optional set wandb here
+# wandb:
+#  name: full-test-esm-smi-ted-v4
 #  project: tiny_fold
 #  entity: cdesforges_wandb
 
 
-output: "./output/overfit"
+output: "./output/full"
 pretrained: null
 resume: null
 disable_checkpoint: false
-matmul_precision: null # "medium"
+matmul_precision: medium # "null"
 save_top_k: 3
 
 data:
   datasets:
     - _target_: boltz.data.module.training.DatasetConfig
-      target_dir: "../train_data/rcsb_processed_targets"
-      msa_dir: "../train_data/rcsb_processed_msa"
+      target_dir: "../train-data/rcsb_processed_targets"
+      msa_dir: "../train-data/rcsb_processed_msa"
       prob: 1.0
       sampler:
         _target_: boltz.data.sample.cluster.ClusterSampler
@@ -50,18 +50,18 @@ data:
   featurizer:
     _target_: boltz.data.feature.featurizer.BoltzFeaturizer
 
-  symmetries: "../train_data/symmetry.pkl"
-  max_tokens: 256 # 512 [overfit config]
-  max_atoms: 2048 # 4608 [overfit config]
-  max_seqs: 1024 # 2048 [overfit config]
+  symmetries: "../train-data/symmetry.pkl"
+  max_tokens: 512 # 256 [overfit config]
+  max_atoms: 4608 # 2048 [overfit config]
+  max_seqs: 2048 # 1024 [overfit config]
   pad_to_max_tokens: true
   pad_to_max_atoms: true
   pad_to_max_seqs: true
-  samples_per_epoch: 256 # 100000 [overfit config]
-  batch_size: 1 # 1 [overfit config]
-  num_workers: 0 # 0 [32]
+  samples_per_epoch: 5000 # 100000 [overfit config]
+  batch_size: 8 # 1 [overfit config]
+  num_workers: 16 # 0 [32]
   random_seed: 42
-  pin_memory: false
+  pin_memory: true
   overfit: null
   crop_validation: true
   return_train_symmetries: true
@@ -85,10 +85,10 @@ model:
   atom_feature_dim: 389
   atoms_per_window_queries: 32
   atoms_per_window_keys: 128
-  compile_pairformer: false # false [overfit config]
+  compile_pairformer: true # false [overfit config]
   nucleotide_rmsd_weight: 5.0
   ligand_rmsd_weight: 10.0
-  ema: false # true [overfit config]
+  ema: true # true [overfit config]
   ema_decay: 0.999
 
   embedder_args:
@@ -96,20 +96,20 @@ model:
     atom_encoder_heads: 4
 
   msa_args:
-    msa_s: 16 # 64 [overfit_config]
-    msa_blocks: 2 # 4 [overfit_config]
+    msa_s: 1 # 64 [overfit_config]
+    msa_blocks: 1 # 4 [overfit_config]
     msa_dropout: 0.0
     z_dropout: 0.0
     pairwise_head_width: 32
-    pairwise_num_heads: 4
-    activation_checkpointing: false # true [overfit config]
+    pairwise_num_heads: 1
+    activation_checkpointing: true # true [overfit config]
     offload_to_cpu: false
 
   pairformer_args:
-    num_blocks: 4 # 48 [overfit_config]
-    num_heads: 2 # 16 [overfit_config]
+    num_blocks: 24 # 48 [overfit_config]
+    num_heads: 8 # 16 [overfit_config]
     dropout: 0.25 # 0.25 [overfit_config]
-    activation_checkpointing: false # true [overfit config]
+    activation_checkpointing: true # true [overfit config]
     offload_to_cpu: false
 
   score_model_args:
@@ -117,12 +117,12 @@ model:
     dim_fourier: 256
     atom_encoder_depth: 3
     atom_encoder_heads: 4
-    token_transformer_depth: 12 # 24 [overfit config]
-    token_transformer_heads: 8 # 16 [overfit config]
+    token_transformer_depth: 16 # 24 [overfit config]
+    token_transformer_heads: 12 # 16 [overfit config]
     atom_decoder_depth: 3
     atom_decoder_heads: 4
     conditioning_transition_layers: 2
-    activation_checkpointing: false # true [switch for CUDA!]
+    activation_checkpointing: true # true [switch for CUDA!]
     offload_to_cpu: false
 
   structure_prediction_training: true
@@ -143,7 +143,7 @@ model:
       num_pae_bins: 64
 
   training_args:
-    recycling_steps: 3
+    recycling_steps: 2
     sampling_steps: 20
     diffusion_multiplicity: 16
     diffusion_samples: 2
@@ -155,7 +155,7 @@ model:
     adam_eps: 0.00000001
     lr_scheduler: af3
     base_lr: 0.0
-    max_lr: 0.0018
+    max_lr: 0.0024
     lr_warmup_no_steps: 1000
     lr_start_decay_after_n_steps: 50000
     lr_decay_every_n_steps: 50000
@@ -164,7 +164,7 @@ model:
     run_confidence_sequentially: false
 
   validation_args:
-    recycling_steps: 3
+    recycling_steps: 2
     sampling_steps: 20
     diffusion_samples: 2
     symmetry_correction: true

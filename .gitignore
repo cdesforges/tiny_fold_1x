@@ -168,3 +168,4 @@ boltz_results_*/
 src/boltz/model/smi_ted_light/
 
 output
+train-data.tar.gz

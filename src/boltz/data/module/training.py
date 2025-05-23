@@ -141,8 +141,9 @@ def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
         atoms = structure.atoms
         ligand_atoms = extract_ligand_atoms(atoms, residues)
 
-        if len(ligand_atoms) == 0:
-        # print(f"[{record.id}] No ligand atoms found.")
+        # if len(ligand_atoms) == 0:
+        #     # print(f"[{record.id}] No ligand atoms found.")
+        #     pass
 
         # For each ligand residue, try to generate a SMILES
         lig_mask = residues["is_standard"] == 0
@@ -158,7 +159,6 @@ def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
                     ligand_smi.append(Chem.MolToSmiles(rdkit_mol))
                 except Exception as e:
                     print(f"[{record.id}] One ligand failed to sanitize: {e}")
-        # print(f"[{record.id}] ligand_smi: {ligand_smi}")
     except Exception as e:
         print(f"[{record.id}] Ligand conversion failed: {e}")
 
