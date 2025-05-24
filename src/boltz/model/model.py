@@ -407,11 +407,34 @@ class Boltz1(LightningModule):
             dict_out.pop("diff_token_repr", None)
         return dict_out
 
-    def smiles_to_emb(self, smiles: list[str], max_len: int = 128) -> torch.Tensor:
+    def smiles_to_emb(self, smiles_batch, max_len: int = 128) -> torch.Tensor:
+        """
+        Accepts List[str] or List[List[str]] and returns [B, D] after
+        learnable ligand aggregation.
+        """
+        if smiles_batch and isinstance(smiles_batch[0], str):
+            smiles_batch = [smiles_batch]
+
+        if not smiles_batch:  # edge‑case []
+            # create one dummy sample so downstream code never sees empty batch
+            smiles_batch = [[]]
+
+        out = []
+        for lig_list in smiles_batch:  # iterate over batch
+            lig_mat = self.smiles_to_emb_single(lig_list, max_len)  # [L, D]
+            emb = self.ligand_aggregator(lig_mat)  # [D]
+            out.append(emb)
+
+        return torch.stack(out, 0)  # [B, D]
+
+    def smiles_to_emb_single(self, smiles: list[str], max_len: int = 128) -> torch.Tensor:
         """Return [B, D] mean‑pooled SMI‑TED embeddings on **self.device**."""
+        if not smiles:
+            return torch.zeros(1, self.smi_ted.n_embd, device=self.device)  # [1, D]
+
         idx, mask = self.smi_ted.tokenize(smiles)
-        idx = idx.to(self.device)
-        mask = mask.to(self.device)
+        idx, mask = idx.to(self.device), mask.to(self.device)
+
         with torch.no_grad():
             h = self.smi_ted.encoder(idx, mask)  # [B, T, D]
             mask = mask.unsqueeze(-1).float()  # [B, T, 1]

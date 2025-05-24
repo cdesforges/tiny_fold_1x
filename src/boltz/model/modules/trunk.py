@@ -87,6 +87,7 @@ class InputEmbedder(nn.Module):
 
         for param in self.esm2.parameters():
             param.requires_grad = False  # Freeze ESM!
+
         esm_embed_dim = self.esm2.embed_dim
         self.proj_esm_out_to_res_type = nn.Linear(esm_embed_dim, const.num_tokens) # 20 to match feats["res_type"] dimensions!
         self.z_attn_proj = nn.Linear(1, token_z)

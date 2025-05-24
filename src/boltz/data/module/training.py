@@ -189,8 +189,15 @@ def atoms_to_molblock(atoms: np.ndarray) -> str:
     for i, atom in enumerate(atoms):
         rd_atom = Chem.Atom(int(atom["element"]))         # element field
         idx = mol.AddAtom(rd_atom)
+
         x, y, z = map(float, atom["coords"])              # coords field
         conf.SetAtomPosition(idx, (x, y, z))
+
+        rd_atom = Chem.Atom(int(atom["element"]))         # charge field
+        rd_atom.SetFormalCharge(int(atom["charge"]))
+
+        if atom["chirality"] == 1:                        # chirality
+            rd_atom.SetChiralTag(Chem.CHI_TETRAHEDRAL_CCW)
 
     mol.AddConformer(conf)
     return Chem.MolToMolBlock(mol)

@@ -30,6 +30,8 @@ dependencies = [
     "scipy==1.13.1",
     #"trifast>=0.1.11",
     "numba==0.61.0",
+    "transformers",
+    "selfies",
 ]
 
 [project.scripts]
