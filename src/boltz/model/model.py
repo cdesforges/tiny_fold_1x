@@ -1,6 +1,6 @@
 import gc
 import random
-from typing import Any, Optional, Union
+from typing import Any, Optional
 
 import torch
 import torch._dynamo
@@ -35,12 +35,6 @@ from boltz.model.modules.trunk import (
 )
 from boltz.model.modules.utils import ExponentialMovingAverage
 from boltz.model.optim.scheduler import AlphaFoldLRScheduler
-
-# smi-ted!!
-from boltz.model.smi_ted_light.load import load_smi_ted
-from transformers import AutoTokenizer
-import selfies as sf
-
 
 
 class Boltz1(LightningModule):
@@ -158,6 +152,8 @@ class Boltz1(LightningModule):
             token_s + 2 * const.num_tokens + 1 + len(const.pocket_contact_info)
         )
         self.s_init = nn.Linear(s_input_dim, token_s, bias=False)
+        self.z_init_1 = nn.Linear(s_input_dim, token_z, bias=False)
+        self.z_init_2 = nn.Linear(s_input_dim, token_z, bias=False)
 
         # Input embeddings
         full_embedder_args = {
@@ -186,6 +182,13 @@ class Boltz1(LightningModule):
         init.gating_init_(self.z_recycle.weight)
 
         # Pairwise stack
+        # self.no_msa = no_msa
+        # if not no_msa:
+        #     self.msa_module = MSAModule(
+        #         token_z=token_z,
+        #         s_input_dim=s_input_dim,
+        #         **msa_args,
+        #     )
         self.pairformer_module = PairformerModule(token_s, token_z, **pairformer_args)
         if compile_pairformer:
             # Big models hit the default cache limit (8)
@@ -241,8 +244,6 @@ class Boltz1(LightningModule):
                 self.confidence_module = ConfidenceModule(
                     token_s,
                     token_z,
-                    pairformer_args=pairformer_args,  # ← add this
-                    imitate_trunk=False,  # explicit but optional
                     compute_pae=alpha_pae > 0,
                     **confidence_model_args,
                 )
@@ -257,34 +258,9 @@ class Boltz1(LightningModule):
                 if name.split(".")[0] != "confidence_module":
                     param.requires_grad = False
 
-        self.attn_proj = nn.Sequential(
-            nn.Linear(1, 8 * token_z),
-            nn.ReLU(),
-            nn.Linear(8 * token_z, token_z),
-        )
-
-        self.use_smi_ted = True
-        self.smi_ted = load_smi_ted(
-            folder="./src/boltz/model/smi_ted_light",
-            ckpt_filename="smi-ted-Light_40.pt",
-            vocab_filename="bert_vocab_curated.txt"
-        )
-
-        for param in self.smi_ted.parameters():
-            param.requires_grad = False
-
-        self.smi_tokenizer = AutoTokenizer.from_pretrained("ibm/materials.selfies-ted")
-
-        hidden_dim = self.smi_ted.n_embd
-        self.smi_proj_s = nn.Linear(hidden_dim, token_s, bias=False)
-        self.smi_proj_z = nn.Linear(hidden_dim, token_z, bias=False)
-
-        self.ligand_aggregator = LigandAggregator(emb_dim=hidden_dim)
-
-
     def forward(
         self,
-        feats: dict[str, Any],
+        feats: dict[str, Tensor],
         recycling_steps: int = 0,
         num_sampling_steps: Optional[int] = None,
         multiplicity_diffusion_train: int = 1,
@@ -297,31 +273,17 @@ class Boltz1(LightningModule):
         with torch.set_grad_enabled(
             self.training and self.structure_prediction_training
         ):
-            s_inputs, esm_attn = self.input_embedder(feats)
+            s_inputs = self.input_embedder(feats)
 
             # Initialize the sequence and pairwise embeddings
-            s_init = self.s_init(s_inputs)  # [B, L, D_s]
-
-            if esm_attn is None:
-                raise ValueError("Expected ESM attention maps but got None")
-
-            # Mean over layers and heads: [B, L+2, L+2]
-            attn_z = esm_attn.mean(dim=(1,2))  # mean over heads
-            attn_z = attn_z[:, 1:-1, 1:-1]  # remove BOS/EOS → [B, L, L]
-
-            # Project into token_z
-            z_init = self.attn_proj(attn_z.unsqueeze(-1))  # [B, L, L, token_z]
+            s_init = self.s_init(s_inputs)
+            z_init = (
+                self.z_init_1(s_inputs)[:, :, None]
+                + self.z_init_2(s_inputs)[:, None, :]
+            )
             relative_position_encoding = self.rel_pos(feats)
             z_init = z_init + relative_position_encoding
             z_init = z_init + self.token_bonds(feats["token_bonds"].float())
-
-            # Inject ligand‑aware bias
-            if self.use_smi_ted and "ligand_smi" in feats and any(feats["ligand_smi"]):
-                if next(self.smi_ted.parameters()).device != self.device:
-                    self.smi_ted.to(self.device)
-                lig_emb = self.aggregate_ligand_embeddings(feats["ligand_smi"])  # [B, D]
-                s_init += self.smi_proj_s(lig_emb).unsqueeze(1)  # [B, 1, D_s]
-                z_init += self.smi_proj_z(lig_emb).unsqueeze(1).unsqueeze(2)  # [B, 1, 1, D_z]
 
             # Perform rounds of the pairwise stack
             s = torch.zeros_like(s_init)
@@ -344,6 +306,10 @@ class Boltz1(LightningModule):
                     # Apply recycling
                     s = s_init + self.s_recycle(self.s_norm(s))
                     z = z_init + self.z_recycle(self.z_norm(z))
+
+                    # # Compute pairwise stack
+                    # if not self.no_msa:
+                    #     z = z + self.msa_module(z, s_inputs, feats)
 
                     # Revert to uncompiled version for validation
                     if self.is_pairformer_compiled and not self.training:
@@ -406,58 +372,6 @@ class Boltz1(LightningModule):
         if self.confidence_prediction and self.confidence_module.use_s_diffusion:
             dict_out.pop("diff_token_repr", None)
         return dict_out
-
-    def smiles_to_emb(self, smiles_batch, max_len: int = 128) -> torch.Tensor:
-        """
-        Accepts List[str] or List[List[str]] and returns [B, D] after
-        learnable ligand aggregation.
-        """
-        if smiles_batch and isinstance(smiles_batch[0], str):
-            smiles_batch = [smiles_batch]
-
-        if not smiles_batch:  # edge‑case []
-            # create one dummy sample so downstream code never sees empty batch
-            smiles_batch = [[]]
-
-        out = []
-        for lig_list in smiles_batch:  # iterate over batch
-            lig_mat = self.smiles_to_emb_single(lig_list, max_len)  # [L, D]
-            emb = self.ligand_aggregator(lig_mat)  # [D]
-            out.append(emb)
-
-        return torch.stack(out, 0)  # [B, D]
-
-    def smiles_to_emb_single(self, smiles: list[str], max_len: int = 128) -> torch.Tensor:
-        """Return [B, D] mean‑pooled SMI‑TED embeddings on **self.device**."""
-        if not smiles:
-            return torch.zeros(1, self.smi_ted.n_embd, device=self.device)  # [1, D]
-
-        idx, mask = self.smi_ted.tokenize(smiles)
-        idx, mask = idx.to(self.device), mask.to(self.device)
-
-        with torch.no_grad():
-            h = self.smi_ted.encoder(idx, mask)  # [B, T, D]
-            mask = mask.unsqueeze(-1).float()  # [B, T, 1]
-            h = h[:, :mask.shape[1], :]  # truncate h if tokenizer returned longer seqs
-            return (h * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-
-    def aggregate_ligand_embeddings(self, ligand_smis: Union[list[str], list[list[str]]],
-                                    max_len: int = 128) -> torch.Tensor:
-        """
-        Accepts a list of SMILES strings (or list of list of SMILES for multi-ligand cases),
-        returns a [B, D] tensor by mean-pooling across ligands if needed.
-        """
-        if isinstance(ligand_smis[0], list):
-            # Each entry is a list of SMILES strings
-            batch_embs = []
-            for lig_list in ligand_smis:
-                embs = self.smiles_to_emb(lig_list, max_len=max_len)  # [L, D]
-                pooled = self.ligand_aggregator(embs)  # [D]
-                batch_embs.append(pooled)
-            return torch.stack(batch_embs).to(self.device)
-        else:
-            # Standard batch of SMILES
-            return self.smiles_to_emb(ligand_smis, max_len=max_len).to(self.device)
 
     def get_true_coordinates(
         self,
@@ -605,6 +519,17 @@ class Boltz1(LightningModule):
 
         lr = self.trainer.optimizers[0].param_groups[0]["lr"]
         self.log("lr", lr, prog_bar=False)
+
+        # self.log(
+        #     "train/grad_norm_msa_module",
+        #     self.gradient_norm(self.msa_module),
+        #     prog_bar=False,
+        # )
+        # self.log(
+        #     "train/param_norm_msa_module",
+        #     self.parameter_norm(self.msa_module),
+        #     prog_bar=False,
+        # )
 
         self.log(
             "train/grad_norm_pairformer_module",
@@ -1336,18 +1261,3 @@ class Boltz1(LightningModule):
 
     def on_test_start(self) -> None:
         self.prepare_eval()
-
-
-class LigandAggregator(nn.Module):
-    def __init__(self, emb_dim):
-        super().__init__()
-        self.attn = nn.Sequential(
-            nn.Linear(emb_dim, emb_dim),
-            nn.ReLU(),
-            nn.Linear(emb_dim, 1)
-        )
-
-    def forward(self, embs):  # embs: [L, D]
-        weights = self.attn(embs)           # [L, 1]
-        weights = torch.softmax(weights, 0) # [L, 1]
-        return (weights * embs).sum(0)      # [D]

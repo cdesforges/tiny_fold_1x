@@ -10,11 +10,13 @@ import torch.nn as nn
 from boltz.model.esm.data import Alphabet, BatchConverter
 from boltz.model.esm.modules import ContactPredictionHead, ESM1bLayerNorm, RobertaLMHead, TransformerLayer
 
+import json
+
 
 class ESM2(nn.Module):
     def __init__(
         self,
-        num_layers: int = 10,
+        num_layers: int = 33,
         embed_dim: int = 1280,
         attention_heads: int = 20,
         alphabet: Union[Alphabet, str] = "ESM-1b",
@@ -145,51 +147,3 @@ class ESM2(nn.Module):
 
     def predict_contacts(self, tokens):
         return self(tokens, return_contacts=True)["contacts"]
-
-
-class Translate():
-    def __init__(self):
-        self.alphabet = Alphabet.from_architecture("ESM-1b")
-        self.batch_converter = self.alphabet.get_batch_converter()
-
-        self.boltz_order = "ARNDCQEGHILKMFPSTWYV"
-        self.aa_to_boltz = {aa: i for i, aa in enumerate(self.boltz_order)}
-
-    def aa_to_esm(self, sequence_batch):
-        # convert whole batch at once to esm
-        return self.batch_converter(sequence_batch)
-
-    def esm_to_boltz(self, tokens):
-        boltz_tensor = torch.full_like(tokens, fill_value=-1)  # -1 for unknowns
-
-        # Loop through tokens and convert only standard amino acids
-        for tok_id in torch.unique(tokens):
-            aa = self.alphabet.get_tok(tok_id.item())
-            if aa in self.aa_to_boltz:
-                boltz_index = self.aa_to_boltz[aa]
-                boltz_tensor[tokens == tok_id] = boltz_index
-
-        return boltz_tensor
-
-    def boltz_to_esm(self, aatype_tensor):
-        boltz_to_aa = {v: k for k, v in self.aa_to_boltz.items()}
-        batch_size, seq_len = aatype_tensor.shape
-        seqs = []
-        for i in range(batch_size):
-            seq = "".join([boltz_to_aa.get(idx.item(), "X") for idx in aatype_tensor[i]])
-            seqs.append(("reconstructed", seq))
-        return self.aa_to_esm(seqs)
-
-    def esm_print(self, seqs):
-        # Get ESM tokens
-        labels, strings, esm_tokens = self.aa_to_esm(seqs)
-        boltz_tensor = self.esm_to_boltz(esm_tokens)
-
-        # Decode token IDs to readable strings (e.g., <cls>, A, R, N, ..., <eos>)
-        decoded_tokens = [self.alphabet.get_tok(tok.item()) for tok in esm_tokens[0]]
-
-        # Print results
-        print("Input sequence:  ", strings[0])
-        print("ESM token IDs:   ", esm_tokens[0].tolist())
-        print("ESM token string:", decoded_tokens)
-        print("Boltz-style:     ", boltz_tensor[0].tolist())

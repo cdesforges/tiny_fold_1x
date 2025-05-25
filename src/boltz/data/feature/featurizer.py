@@ -26,6 +26,8 @@ from boltz.data.types import (
 )
 from boltz.model.modules.utils import center_random_augmentation
 
+from .translate import Translate
+
 ####################################################################################################
 # HELPERS
 ####################################################################################################
@@ -1126,6 +1128,8 @@ def process_chain_feature_constraints(
 
 class BoltzFeaturizer:
     """Boltz featurizer."""
+    def __init__(self):
+        self.translator = Translate()  # load once
 
     def process(
         self,
@@ -1176,6 +1180,15 @@ class BoltzFeaturizer:
         else:
             max_seqs_batch = max_seqs
 
+        # pass to helpers for esm and smi-ted
+        esm_tokens, esm_indices = self.translator.boltz_to_esm(
+            residues=data.structure.residues, max_len=max_seqs_batch
+        )
+        smi_strings, smi_indices = self.translator.boltz_to_smi_ted(
+            residues=data.structure.residues,
+            max_len=max_seqs_batch
+        )
+
         # Compute token features
         token_features = process_token_features(
             data,
@@ -1220,6 +1233,13 @@ class BoltzFeaturizer:
             residue_constraint_features = process_residue_constraint_features(data)
             chain_constraint_features = process_chain_feature_constraints(data)
 
+        custom_features = {
+            "esm_tokens": esm_tokens,
+            "esm_indices": esm_indices,
+            "smiles_strings": smi_strings,
+            "smiles_indices_tups": smi_indices,
+        }
+
         return {
             **token_features,
             **atom_features,
@@ -1227,4 +1247,5 @@ class BoltzFeaturizer:
             **symmetry_features,
             **residue_constraint_features,
             **chain_constraint_features,
+            **custom_features,
         }

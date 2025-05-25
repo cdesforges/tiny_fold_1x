@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Any
+from typing import Optional
 
 import numpy as np
 import pytorch_lightning as pl
@@ -16,11 +16,6 @@ from boltz.data.filter.dynamic.filter import DynamicFilter
 from boltz.data.sample.sampler import Sample, Sampler
 from boltz.data.tokenize.tokenizer import Tokenizer
 from boltz.data.types import MSA, Connection, Input, Manifest, Record, Structure
-
-from rdkit import Chem
-from rdkit.Chem import AllChem
-
-from boltz.data import const
 
 
 @dataclass
@@ -134,34 +129,6 @@ def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
         mask=structure["mask"],
     )
 
-    # smi-ted ligand extraction
-    ligand_smi = []
-    try:
-        residues = structure.residues
-        atoms = structure.atoms
-        ligand_atoms = extract_ligand_atoms(atoms, residues)
-
-        # if len(ligand_atoms) == 0:
-        #     # print(f"[{record.id}] No ligand atoms found.")
-        #     pass
-
-        # For each ligand residue, try to generate a SMILES
-        lig_mask = residues["is_standard"] == 0
-        starts = residues["atom_idx"][lig_mask]
-        counts = residues["atom_num"][lig_mask]
-        for s, n in zip(starts, counts):
-            atoms_block = atoms[s: s + n]
-            mol_block = atoms_to_molblock(atoms_block)
-            rdkit_mol = Chem.MolFromMolBlock(mol_block, sanitize=False)
-            if rdkit_mol:
-                try:
-                    Chem.SanitizeMol(rdkit_mol)
-                    ligand_smi.append(Chem.MolToSmiles(rdkit_mol))
-                except Exception as e:
-                    print(f"[{record.id}] One ligand failed to sanitize: {e}")
-    except Exception as e:
-        print(f"[{record.id}] Ligand conversion failed: {e}")
-
     msas = {}
     for chain in record.chains:
         msa_id = chain.msa_id
@@ -170,40 +137,10 @@ def load_input(record: Record, target_dir: Path, msa_dir: Path) -> Input:
             msa = np.load(msa_dir / f"{msa_id}.npz")
             msas[chain.chain_id] = MSA(**msa)
 
-    return Input(structure, msas, ligand_smi)
-
-def extract_ligand_atoms(atoms, residues):
-    lig_mask = residues["is_standard"] == 0
-    starts = residues["atom_idx"][lig_mask]
-    counts = residues["atom_num"][lig_mask]
-    lig_ranges = [np.arange(s, s + n) for s, n in zip(starts, counts) if n > 0]
-    if not lig_ranges:
-        return np.array([], dtype=atoms.dtype)
-    lig_atom_ids = np.concatenate(lig_ranges)
-    return atoms[lig_atom_ids]
-
-def atoms_to_molblock(atoms: np.ndarray) -> str:
-    mol = Chem.RWMol()
-    conf = Chem.Conformer(len(atoms))
-
-    for i, atom in enumerate(atoms):
-        rd_atom = Chem.Atom(int(atom["element"]))         # element field
-        idx = mol.AddAtom(rd_atom)
-
-        x, y, z = map(float, atom["coords"])              # coords field
-        conf.SetAtomPosition(idx, (x, y, z))
-
-        rd_atom = Chem.Atom(int(atom["element"]))         # charge field
-        rd_atom.SetFormalCharge(int(atom["charge"]))
-
-        if atom["chirality"] == 1:                        # chirality
-            rd_atom.SetChiralTag(Chem.CHI_TETRAHEDRAL_CCW)
-
-    mol.AddConformer(conf)
-    return Chem.MolToMolBlock(mol)
+    return Input(structure, msas)
 
 
-def collate(data: list[dict[str, Tensor]]) -> dict[str, Any]:
+def collate(data: list[dict[str, Tensor]]) -> dict[str, Tensor]:
     """Collate the data.
 
     Parameters
@@ -217,14 +154,12 @@ def collate(data: list[dict[str, Tensor]]) -> dict[str, Any]:
         The collated data.
 
     """
-    collated = {}
-    # Explicitly handle ligand_smi: keep as list of lists, do not stack or pad
-    collated["ligand_smi"] = [d["ligand_smi"] for d in data]
-
+    # Get the keys
     keys = data[0].keys()
+
+    # Collate the data
+    collated = {}
     for key in keys:
-        if key == "ligand_smi":
-            continue
         values = [d[key] for d in data]
 
         if key not in [
@@ -235,12 +170,14 @@ def collate(data: list[dict[str, Tensor]]) -> dict[str, Any]:
             "amino_acids_symmetries",
             "ligand_symmetries",
         ]:
+            # Check if all have the same shape
             shape = values[0].shape
             if not all(v.shape == shape for v in values):
                 values, _ = pad_to_max(values, 0)
             else:
                 values = torch.stack(values, dim=0)
 
+        # Stack the values
         collated[key] = values
 
     return collated
@@ -383,8 +320,6 @@ class TrainingDataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f"Featurizer failed on {sample.record.id} with error {e}. Skipping.")
             return self.__getitem__(idx)
-
-        features["ligand_smi"] = input_data.ligand_smi  # type: ignore[assignment]
 
         return features
 
@@ -533,8 +468,6 @@ class ValidationDataset(torch.utils.data.Dataset):
         except Exception as e:
             print(f"Featurizer failed on {record.id} with error {e}. Skipping.")
             return self.__getitem__(0)
-
-        features["ligand_smi"] = input_data.ligand_smi  # type: ignore[assignment]
 
         return features
 

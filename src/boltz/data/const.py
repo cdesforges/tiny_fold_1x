@@ -380,5 +380,3 @@ vdw_radii = [
     2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0, 2.0
 ]
 # fmt: on
-
-MOL_TYPE_LIGAND = 3

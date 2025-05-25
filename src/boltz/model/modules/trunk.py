@@ -1,11 +1,12 @@
-from typing import Dict, Tuple, Any
+from typing import Dict, Tuple, Any, Optional
 
 from fairscale.nn.checkpoint.checkpoint_activations import checkpoint_wrapper
 import torch
 from torch import Tensor, nn
 
 from boltz.data import const
-from boltz.model.esm.esm2 import ESM2, Translate
+from boltz.model.esm.esm2 import ESM2
+from boltz.data.feature.translate import Translate
 from boltz.model.layers.attention import AttentionPairBias
 from boltz.model.layers.dropout import get_dropout_mask
 from boltz.model.layers.outer_product_mean import OuterProductMean
@@ -20,6 +21,25 @@ from boltz.model.layers.triangular_mult import (
     TriangleMultiplicationOutgoing,
 )
 from boltz.model.modules.encoders import AtomAttentionEncoder
+
+# smi-ted!!
+from boltz.model.smi_ted_light.load import load_smi_ted
+
+
+# class LigandAggregator(nn.Module):
+#     def __init__(self, emb_dim):
+#         super().__init__()
+#         self.attn = nn.Sequential(
+#             nn.Linear(emb_dim, emb_dim),
+#             nn.ReLU(),
+#             nn.Linear(emb_dim, 1)
+#         )
+#
+#     def forward(self, embs):  # embs: [L, D]
+#         weights = self.attn(embs)           # [L, 1]
+#         weights = torch.softmax(weights, 0) # [L, 1]
+#         return (weights * embs).sum(0)      # [D]
+
 
 
 class InputEmbedder(nn.Module):
@@ -37,6 +57,7 @@ class InputEmbedder(nn.Module):
         atom_encoder_depth: int,
         atom_encoder_heads: int,
         no_atom_encoder: bool = False,
+        device: Optional[torch.device] = None,
     ) -> None:
         """Initialize the input embedder.
 
@@ -82,17 +103,26 @@ class InputEmbedder(nn.Module):
                 structure_prediction=False,
             )
 
+        # ESM
         self.esm2 = ESM2()
         self.output_layer = self.esm2.num_layers
+        self.esm_proj = nn.Linear(self.esm2.embed_dim, token_s, bias=False)
 
         for param in self.esm2.parameters():
             param.requires_grad = False  # Freeze ESM!
 
-        esm_embed_dim = self.esm2.embed_dim
-        self.proj_esm_out_to_res_type = nn.Linear(esm_embed_dim, const.num_tokens) # 20 to match feats["res_type"] dimensions!
-        self.z_attn_proj = nn.Linear(1, token_z)
+        # smi-ted
+        self.smi_ted = load_smi_ted(
+            folder="./src/boltz/model/smi_ted_light",
+            ckpt_filename="smi-ted-Light_40.pt",
+            vocab_filename="bert_vocab_curated.txt",
+        )
+        self.smi_ted_proj = nn.Linear(self.smi_ted.n_embd, token_s, bias=False)
+
+        for param in self.smi_ted.parameters():
+            param.requires_grad = False
+
         self.translator = Translate()
-        self.esm_norm = nn.LayerNorm(esm_embed_dim)
 
     def forward(self, feats: Dict[str, Tensor]) -> tuple[Tensor, Any | None]:
         """Perform the forward pass.
@@ -107,52 +137,111 @@ class InputEmbedder(nn.Module):
         Tensor
             The embedded tokens.
 
+        Custom feats keys
+        ----------
+            "esm_tokens": esm_tokens, -> list of esm tokens ready to pass to esm2 as tensor
+            "esm_indices": esm_indices, -> list of the corresponding indices to map back to as tensor
+            "smiles_strings": smi_strings, -> list of smiles strings as ascii coded tensor
+            "smiles_indices_tups": smi_indices_tups, -> tensor of [length, 2] for each ligand (dim1=token idx, dim2=(start,end))
+
         """
         # Load relevant features
-        res_type = feats["res_type"]
+        res_types = feats["res_type"]
         profile = feats["profile"]
         deletion_mean = feats["deletion_mean"].unsqueeze(-1)
         pocket_feature = feats["pocket_feature"]
+        seq_len = res_types.shape[1]
+        device = res_types.device
 
-        # Extract aatype from one_hot res_type
-        aatype = res_type.argmax(dim=-1) # [B, L]
+        print(f"MPS memory allocated: {torch.mps.current_allocated_memory() / (1024 ** 3):.2f} GB")
 
-        # Convert to ESM tokens
-        _, _, esm_tokens = self.translator.boltz_to_esm(aatype)
-        esm_tokens = esm_tokens.to(res_type.device)
+        # set new models on device
+        if next(self.esm2.parameters()).device != device:
+            self.esm2 = self.esm2.to(device)
+        if next(self.smi_ted.parameters()).device != device:
+            self.smi_ted = self.smi_ted.to(device)
 
-        # Pass through esm2
-        esm_out = self.esm2(
-            esm_tokens,
-            repr_layers=[self.output_layer],
-            return_contacts=False,
-            need_head_weights=True,
-        )
+        # pass feats through esm (unsqueeze b/c esm2 requires batch_dim first)
+        esm_out = self.esm2(feats["esm_tokens"], repr_layers=[self.esm2.num_layers])
 
-        s_inputs = esm_out["representations"][self.output_layer][:, 1:-1] # [B, L, d_esm]
-        s_inputs = self.esm_norm(s_inputs) # normalize in case esm outputs are crazy!
-        s_proj = self.proj_esm_out_to_res_type(s_inputs) # [B, L, const.num_tokens]
+        # convert esm to boltz style tensor
+        esm_embeddings = self.translator.esm_to_boltz(esm_out,
+                                                      feats["esm_indices"],
+                                                      seq_len,
+                                                      )
 
-        # Get atom level embedding if enables
+        # run through smi-ted (requires manual batching unfortunately)
+        B, _ = feats["smiles_strings"].shape[:2]
+        D = self.smi_ted.n_embd
 
+        if feats["smiles_indices_tups"].numel() == 0:
+            # print("No SMI-TED embeddings found. Making zero tensor...")
+            smi_ted_embeddings = torch.zeros(B, seq_len, D, device=device)
+        else:
+            # Smi-ted requires manual batching unfortunately...
+            smi_embs_per_batch: list[Tensor] = [] # list where each index is one batch
+            batch_size = feats["smiles_strings"].shape[0]
+
+            for b in range(batch_size):
+                ascii_mat   = feats["smiles_strings"][b]          # (N_lig, seq_len)
+                spans       = feats["smiles_indices_tups"][b]     # (N_lig, 2)
+                smiles_list = self.translator.ascii_tensor_to_smiles(ascii_mat)
+
+                # embed with smi‑ted
+                if len(smiles_list) == 0:
+                    lig_embs = torch.zeros((seq_len, self.smi_ted.n_embd), device=device)
+                else:
+                    lig_embs = self.smi_ted.encode(smiles_list, return_torch=True).to(device)
+
+                # broadcast ligand embedding to all atom‑tokens
+                emb = self.translator.smi_ted_to_boltz(
+                          lig_embs,
+                          spans,
+                          seq_len,
+                       )                                    # (L, D)
+
+                smi_embs_per_batch.append(emb)
+
+            smi_ted_embeddings = torch.stack(smi_embs_per_batch, dim=0)  # (B, L, D)
+
+        # # Check smiles_indices_tups
+        # if len(feats["smiles_indices_tups"]) == 0 or feats["smiles_indices_tups"][0].numel() == 0:
+        #     print("No smiles_indices_tups found.")
+        # else:
+        #     print(f"smiles_indices_tups[0] shape: {feats['smiles_indices_tups'][0].shape}")
+        #     print(f"First few spans: {feats['smiles_indices_tups'][0][:5]}")
+
+        # project to same embedding dimension (preserve zeros with bias=False)
+        esm_embeddings = self.esm_proj(esm_embeddings)
+        smi_ted_embeddings = self.smi_ted_proj(smi_ted_embeddings)
+
+        # check for overlap!
+        B, L, D = esm_embeddings.shape
+        for b in range(B):
+            esm_nonzero_mask = (esm_embeddings[b] != 0).any(dim=-1)
+            smi_nonzero_mask = (smi_ted_embeddings[b] != 0).any(dim=-1)
+            overlap = esm_nonzero_mask & smi_nonzero_mask
+
+            overlap_indices = overlap.nonzero(as_tuple=True)[0].tolist()
+            if overlap.any():
+                overlap_indices = overlap.nonzero(as_tuple=True)[0].tolist()
+                print(f"Sample {b} overlaps at L indices: {overlap_indices}")
+                raise ValueError("Overlap detected: both embeddings populated at same positions")
+
+        combined_embeddings = esm_embeddings + smi_ted_embeddings
+
+        # Compute input embedding
         if self.no_atom_encoder:
             a = torch.zeros(
-                (*s_proj.shape[:-1], self.token_s),  # (B, L, token_s)
-                dtype=s_proj.dtype,
-                device=s_proj.device,
+                (res_types.shape[0], res_types.shape[1], self.token_s),
+                device=res_types.device,
             )
         else:
             a, _, _, _, _ = self.atom_attention_encoder(feats)
 
-        s = torch.cat([
-            a,
-            s_proj,
-            profile,
-            deletion_mean,
-            pocket_feature
-        ], dim=-1)
+        s = torch.cat([a + combined_embeddings, res_types, profile, deletion_mean, pocket_feature], dim=-1)
 
-        return s, esm_out["attentions"] if "attentions" in esm_out else None
+        return s
 
 
 class MSAModule(nn.Module):

@@ -500,7 +500,6 @@ class Input:
 
     structure: Structure
     msa: dict[str, MSA]
-    ligand_smi: str = ""
     record: Optional[Record] = None
     residue_constraints: Optional[ResidueConstraints] = None
 
